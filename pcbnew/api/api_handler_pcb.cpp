@@ -135,6 +135,7 @@ API_HANDLER_PCB::API_HANDLER_PCB( std::shared_ptr<PCB_CONTEXT> aContext, PCB_EDI
     registerHandler<GetItems, GetItemsResponse>( &API_HANDLER_PCB::handleGetItems );
 
     registerHandler<SetBoardEnabledLayers, BoardEnabledLayersResponse>( &API_HANDLER_PCB::handleSetBoardEnabledLayers );
+    registerHandler<UpdateBoardStackup, BoardStackupResponse>( &API_HANDLER_PCB::handleUpdateBoardStackup );
     registerHandler<GetBoardDesignRules, BoardDesignRulesResponse>( &API_HANDLER_PCB::handleGetBoardDesignRules );
     registerHandler<SetBoardDesignRules, BoardDesignRulesResponse>( &API_HANDLER_PCB::handleSetBoardDesignRules );
     registerHandler<GetCustomDesignRules, CustomRulesResponse>( &API_HANDLER_PCB::handleGetCustomDesignRules );
@@ -676,6 +677,53 @@ HANDLER_RESULT<BoardEnabledLayersResponse> API_HANDLER_PCB::handleSetBoardEnable
     response.set_copper_layer_count( copperLayerCount );
     board::PackLayerSet( *response.mutable_layers(), enabled );
 
+    return response;
+}
+
+
+HANDLER_RESULT<BoardStackupResponse> API_HANDLER_PCB::handleUpdateBoardStackup(
+        const HANDLER_CONTEXT<UpdateBoardStackup>& aCtx )
+{
+    if( HANDLER_RESULT<bool> documentValidation = validateDocument( aCtx.Request.board() ); !documentValidation )
+        return tl::unexpected( documentValidation.error() );
+
+    if( std::optional<ApiResponseStatus> busy = checkForBusy() )
+        return tl::unexpected( *busy );
+
+    BOARD*                 board = this->board();
+    BOARD_DESIGN_SETTINGS& settings = board->GetDesignSettings();
+
+    // Start from the stackup the board uses now, matched to its enabled layers
+    BOARD_STACKUP stackup = board->GetStackupOrDefault();
+    stackup.SynchronizeWithBoard( &settings );
+
+    wxString error;
+
+    if( !stackup.Deserialize( aCtx.Request.stackup(), &error ) )
+    {
+        ApiResponseStatus e;
+        e.set_status( ApiStatusCode::AS_BAD_REQUEST );
+        e.set_error_message( error.utf8_string() );
+        return tl::unexpected( e );
+    }
+
+    int  thickness = stackup.BuildBoardThicknessFromStackup();
+    bool modified = !settings.m_HasStackup || settings.GetStackupDescriptor() != stackup
+                    || settings.GetBoardThickness() != thickness;
+
+    if( modified )
+    {
+        settings.GetStackupDescriptor() = stackup;
+        settings.SetBoardThickness( thickness );
+        settings.m_HasStackup = true;
+
+        // Backdrill stub lengths come from layer distances
+        board->BumpDrillModelGeneration();
+        onModified();
+    }
+
+    BoardStackupResponse response;
+    board::PackBoardStackup( *board, *response.mutable_stackup() );
     return response;
 }
 

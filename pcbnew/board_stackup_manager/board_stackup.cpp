@@ -21,6 +21,8 @@
 
 #include "board_stackup.h"
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <base_units.h>
 #include <string_utils.h>
 #include <layer_ids.h>
@@ -34,6 +36,51 @@
 #include <api/board/board.pb.h>
 #include <api/api_enums.h>
 #include <api/api_utils.h>
+
+
+/**
+ * @return the color a stackup color name stands for: one of the standard fabrication colors of
+ * the layer type, or a "#RRGGBBAA" value
+ */
+static KIGFX::COLOR4D stackupColor( BOARD_STACKUP_ITEM_TYPE aType, const wxString& aName )
+{
+    const std::vector<FAB_LAYER_COLOR>& standard = GetStandardColors( aType );
+
+    for( int ii = 0; ii < GetColorUserDefinedListIdx( aType ); ++ii )
+    {
+        if( standard[ii].GetName() == aName )
+            return standard[ii].GetColor( aType );
+    }
+
+    return KIGFX::COLOR4D( aName );
+}
+
+
+/**
+ * @return the name stored for a color: the standard fabrication color with the same RGB value,
+ * so that names written to Gerber job files survive a round trip, or else a "#RRGGBBAA" value
+ */
+static wxString stackupColorName( BOARD_STACKUP_ITEM_TYPE aType, const KIGFX::COLOR4D& aColor )
+{
+    const std::vector<FAB_LAYER_COLOR>& standard = GetStandardColors( aType );
+    wxColour                            wanted = aColor.ToColour();
+
+    for( int ii = 0; ii < GetColorUserDefinedListIdx( aType ); ++ii )
+    {
+        if( !IsPrmSpecified( standard[ii].GetName() ) )
+            continue;
+
+        wxColour candidate = standard[ii].GetColor( aType ).ToColour();
+
+        if( candidate.Red() == wanted.Red() && candidate.Green() == wanted.Green()
+            && candidate.Blue() == wanted.Blue() )
+        {
+            return standard[ii].GetName();
+        }
+    }
+
+    return aColor.ToHexString();
+}
 
 
 bool DIELECTRIC_PRMS::operator==( const DIELECTRIC_PRMS& aOther ) const
@@ -486,10 +533,7 @@ void BOARD_STACKUP::Serialize( kiapi::board::BoardStackup& stackup ) const
             wxString colorStr = item->GetColor( 0 );
 
             if( IsPrmSpecified( colorStr ) )
-            {
-                KIGFX::COLOR4D color( colorStr );
-                kiapi::common::PackColor( *layer->mutable_color(), color );
-            }
+                kiapi::common::PackColor( *layer->mutable_color(), stackupColor( item->GetType(), colorStr ) );
         }
 
         switch( item->GetType() )
@@ -577,7 +621,6 @@ void BOARD_STACKUP::Serialize( google::protobuf::Any& aContainer ) const
 
 bool BOARD_STACKUP::Deserialize( const google::protobuf::Any& aContainer )
 {
-    // Read-only for now
     kiapi::board::BoardStackup stackup;
 
     if( !aContainer.UnpackTo( &stackup ) )
@@ -587,10 +630,218 @@ bool BOARD_STACKUP::Deserialize( const google::protobuf::Any& aContainer )
 }
 
 
-bool BOARD_STACKUP::Deserialize( const kiapi::board::BoardStackup& aInput )
+bool BOARD_STACKUP::Deserialize( const kiapi::board::BoardStackup& aInput, wxString* aError )
 {
-    // Read-only for now
-    return false;
+    using namespace kiapi::board;
+
+    auto reject =
+            [&]( const wxString& aReason )
+            {
+                if( aError )
+                    *aError = aReason;
+
+                return false;
+            };
+
+    auto validThickness =
+            []( int64_t aValue )
+            {
+                return aValue > 0 && aValue <= std::numeric_limits<int>::max();
+            };
+
+    if( aInput.layers_size() != GetCount() )
+    {
+        return reject( wxString::Format( wxT( "the message has %d layers but the board stackup has %d; "
+                                              "the copper layer count is changed with "
+                                              "SetBoardEnabledLayers" ),
+                                         aInput.layers_size(), GetCount() ) );
+    }
+
+    BOARD_STACKUP updated( *this );
+
+    for( int ii = 0; ii < aInput.layers_size(); ++ii )
+    {
+        const BoardStackupLayer& layer = aInput.layers( ii );
+        BOARD_STACKUP_ITEM*      item = updated.m_list[ii];
+        BOARD_STACKUP_ITEM_TYPE  type = item->GetType();
+
+        if( layer.type() != ToProtoEnum<BOARD_STACKUP_ITEM_TYPE, BoardStackupLayerType>( type ) )
+            return reject( wxString::Format( wxT( "layer %d: the layer type differs from the board" ), ii ) );
+
+        if( type != BS_ITEM_TYPE_DIELECTRIC
+            && layer.layer() != ToProtoEnum<PCB_LAYER_ID, types::BoardLayer>( item->GetBrdLayerId() ) )
+        {
+            return reject( wxString::Format( wxT( "layer %d: the board layer differs from the board" ), ii ) );
+        }
+
+        if( !layer.enabled() )
+            return reject( wxString::Format( wxT( "layer %d: stackup layers cannot be disabled" ), ii ) );
+
+        if( item->IsColorEditable() )
+        {
+            if( layer.has_color() )
+            {
+                KIGFX::COLOR4D color = kiapi::common::UnpackColor( layer.color() );
+                item->SetColor( stackupColorName( type, color ) );
+            }
+            else
+            {
+                item->SetColor( NotSpecifiedPrm() );
+            }
+        }
+        else if( layer.has_color() )
+        {
+            return reject( wxString::Format( wxT( "layer %d: this layer has no color" ), ii ) );
+        }
+
+        auto material =
+                []( const std::string& aName )
+                {
+                    return aName.empty() ? NotSpecifiedPrm() : wxString::FromUTF8( aName );
+                };
+
+        switch( type )
+        {
+        case BS_ITEM_TYPE_COPPER:
+            if( layer.details_case() != BoardStackupLayer::DETAILS_NOT_SET )
+                return reject( wxString::Format( wxT( "layer %d: copper layers have no details" ), ii ) );
+
+            if( !validThickness( layer.thickness().value_nm() ) )
+                return reject( wxString::Format( wxT( "layer %d: the thickness must be positive" ), ii ) );
+
+            item->SetThickness( static_cast<int>( layer.thickness().value_nm() ) );
+            break;
+
+        case BS_ITEM_TYPE_DIELECTRIC:
+        {
+            if( !layer.has_dielectric() || layer.dielectric().layer_size() == 0 )
+                return reject( wxString::Format( wxT( "layer %d: dielectric properties are missing" ), ii ) );
+
+            const BoardStackupDielectricLayer& dielectric = layer.dielectric();
+
+            if( dielectric.type() == BoardStackupDielectricType::BSDT_CORE )
+                item->SetTypeName( KEY_CORE );
+            else if( dielectric.type() == BoardStackupDielectricType::BSDT_PREPREG )
+                item->SetTypeName( KEY_PREPREG );
+            else
+                return reject( wxString::Format( wxT( "layer %d: a dielectric is a core or a prepreg" ), ii ) );
+
+            while( item->GetSublayersCount() < dielectric.layer_size() )
+                item->AddDielectricPrms( item->GetSublayersCount() );
+
+            while( item->GetSublayersCount() > dielectric.layer_size() )
+                item->RemoveDielectricPrms( item->GetSublayersCount() - 1 );
+
+            for( int sub = 0; sub < dielectric.layer_size(); ++sub )
+            {
+                const BoardStackupDielectricProperties& props = dielectric.layer( sub );
+
+                if( !validThickness( props.thickness().value_nm() ) )
+                {
+                    return reject( wxString::Format( wxT( "layer %d: sub-layer %d: the thickness must be "
+                                                          "positive" ),
+                                                     ii, sub ) );
+                }
+
+                if( !std::isfinite( props.epsilon_r() ) || props.epsilon_r() < 1.0
+                    || !std::isfinite( props.loss_tangent() ) || props.loss_tangent() < 0.0 )
+                {
+                    return reject( wxString::Format( wxT( "layer %d: sub-layer %d: epsilon_r must be at "
+                                                          "least 1 and the loss tangent not negative" ),
+                                                     ii, sub ) );
+                }
+
+                if( props.dielectric_model() == DielectricModel::DM_UNKNOWN )
+                {
+                    return reject( wxString::Format( wxT( "layer %d: sub-layer %d: the dielectric model "
+                                                          "is missing" ),
+                                                     ii, sub ) );
+                }
+
+                double frequency = props.has_spec_frequency() ? props.spec_frequency() : 0.0;
+
+                if( !std::isfinite( frequency ) || frequency < 0.0 )
+                {
+                    return reject( wxString::Format( wxT( "layer %d: sub-layer %d: the frequency must not "
+                                                          "be negative" ),
+                                                     ii, sub ) );
+                }
+
+                item->SetThickness( static_cast<int>( props.thickness().value_nm() ), sub );
+                item->SetThicknessLocked( props.thickness_locked(), sub );
+                item->SetEpsilonR( props.epsilon_r(), sub );
+                item->SetLossTangent( props.loss_tangent(), sub );
+                item->SetMaterial( material( props.material_name() ), sub );
+                item->SetSpecFreq( frequency, sub );
+                item->SetDielectricModel( FromProtoEnum<DIELECTRIC_MODEL>( props.dielectric_model() ), sub );
+            }
+
+            break;
+        }
+
+        case BS_ITEM_TYPE_SOLDERMASK:
+        {
+            if( !layer.has_soldermask() )
+                return reject( wxString::Format( wxT( "layer %d: solder mask properties are missing" ), ii ) );
+
+            const BoardStackupSoldermaskLayer& mask = layer.soldermask();
+
+            if( !validThickness( mask.thickness().value_nm() ) )
+                return reject( wxString::Format( wxT( "layer %d: the thickness must be positive" ), ii ) );
+
+            if( !std::isfinite( mask.epsilon_r() ) || mask.epsilon_r() < 1.0
+                || !std::isfinite( mask.loss_tangent() ) || mask.loss_tangent() < 0.0 )
+            {
+                return reject( wxString::Format( wxT( "layer %d: epsilon_r must be at least 1 and the "
+                                                      "loss tangent not negative" ),
+                                                 ii ) );
+            }
+
+            item->SetThickness( static_cast<int>( mask.thickness().value_nm() ) );
+            item->SetEpsilonR( mask.epsilon_r() );
+            item->SetLossTangent( mask.loss_tangent() );
+            item->SetMaterial( material( mask.material_name() ) );
+            break;
+        }
+
+        case BS_ITEM_TYPE_SILKSCREEN:
+            if( !layer.has_silkscreen() )
+                return reject( wxString::Format( wxT( "layer %d: silkscreen properties are missing" ), ii ) );
+
+            item->SetMaterial( material( layer.silkscreen().material_name() ) );
+            break;
+
+        case BS_ITEM_TYPE_SOLDERPASTE:
+            if( layer.details_case() != BoardStackupLayer::DETAILS_NOT_SET )
+                return reject( wxString::Format( wxT( "layer %d: solder paste layers have no details" ), ii ) );
+
+            break;
+
+        default:
+            return reject( wxString::Format( wxT( "layer %d: unsupported layer type" ), ii ) );
+        }
+    }
+
+    wxString      finish = wxString::FromUTF8( aInput.finish().type_name() );
+    wxArrayString finishes = GetStandardCopperFinishes( false );
+
+    if( finishes.Index( finish ) == wxNOT_FOUND )
+    {
+        return reject( wxString::Format( wxT( "'%s' is not a copper finish; use one of: %s" ), finish,
+                                         wxJoin( finishes, ',' ) ) );
+    }
+
+    if( aInput.edge().connector().type() == BoardEdgeConnectorType::BECT_UNKNOWN )
+        return reject( wxT( "the edge connector type is missing" ) );
+
+    updated.m_FinishType = finish;
+    updated.m_HasDielectricConstrains = aInput.impedance().is_controlled();
+    updated.m_EdgeConnectorConstraints =
+            FromProtoEnum<BS_EDGE_CONNECTOR_CONSTRAINTS>( aInput.edge().connector().type() );
+    updated.m_EdgePlating = aInput.edge().plating().has_edge_plating();
+
+    *this = updated;
+    return true;
 }
 
 

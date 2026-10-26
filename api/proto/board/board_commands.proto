@@ -47,8 +47,14 @@ message BoardStackupResponse
   kiapi.board.BoardStackup stackup = 1;
 }
 
-// Changes the stackup for the given board according to the contents of the message (**not yet implemented**)
-// WARNING: any existing content on layers that are removed by this call is deleted.  This operation cannot be undone.
+// Replaces the stackup properties of the given board with the contents of the message: layer
+// thicknesses, materials, dielectric properties and sub-layers, colors, copper finish, impedance
+// control and edge settings.  The message must describe the board's current layer structure (the
+// layers returned by GetBoardStackup, in the same order); the copper layer count is changed with
+// SetBoardEnabledLayers.  Fields left unset are cleared (an unset color becomes "not specified"),
+// so clients should start from GetBoardStackup.  Solder mask and silkscreen colors that match a
+// standard fabrication color are stored by that color's name.  The board thickness is updated to
+// the stackup's total.  The layer user_name field is ignored.
 // Returns BoardStackupResponse with the updated stackup, in normalized form
 message UpdateBoardStackup
 {

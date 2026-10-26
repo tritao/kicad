@@ -253,7 +253,19 @@ public:
     bool Deserialize( const google::protobuf::Any &aContainer ) override;
 
     void Serialize( kiapi::board::BoardStackup& aOutput ) const;
-    bool Deserialize( const kiapi::board::BoardStackup& aInput );
+
+    /**
+     * Update the properties of this stackup from an API message.
+     *
+     * The message must describe the same layer structure as this stackup: the same item types
+     * and board layers, in the same order.  Dielectric layers may change their number of
+     * sub-layers.  Adding or removing copper layers is not done here (see SetBoardEnabledLayers).
+     * Nothing is changed if the message is rejected.
+     *
+     * @param aError receives the reason when the message is rejected
+     * @return true if the stackup was updated
+     */
+    bool Deserialize( const kiapi::board::BoardStackup& aInput, wxString* aError = nullptr );
 
     const std::vector<BOARD_STACKUP_ITEM*>& GetList() const { return m_list; }
 
